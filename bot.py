@@ -1,14 +1,13 @@
 import os
 import re
-import socket
 import time
 import asyncio
 from typing import List, Tuple, Optional
 from urllib.parse import urlparse
 
-import aiohttp 
-
-from aiogram import Bot, Dispatcher, types
+import requests
+import aiohttp
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 from bs4 import BeautifulSoup
@@ -19,10 +18,11 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN не установлен в переменных окружения!")
+
 if not ADMIN_IDS:
     raise RuntimeError("❌ ADMIN_IDS не установлены!")
 
-# === Глобальные константы ===
+# === Источники прокси ===
 PROXY_SOURCES = [
     "https://proxy.telegram.org",
     "https://t.me/proxy",
@@ -31,8 +31,8 @@ PROXY_SOURCES = [
     "https://t.me/ProxyFree_RuBot",
 ]
 
-TIMEOUT = 5.0  # секунд на проверку одного прокси
-MAX_PROXIES_TO_CHECK = 50  # лимит, чтобы не тормозить
+TIMEOUT = 5.0
+MAX_PROXIES_TO_CHECK = 50
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -44,11 +44,13 @@ def is_admin(user_id: int) -> bool:
 
 def parse_proxy_line(line: str) -> Optional[Tuple[str, int, str]]:
     """
-    Извлекает IP:PORT:SECRET из строки вида:
+    Извлекает IP:PORT:SECRET из строки.
+    Поддерживает:
     - tg://proxy?server=ip&port=port&secret=secret
-    - или просто ip:port:secret
+    - ip:port:secret
     """
-    # Попробуем URL
+
+    # tg://proxy
     if "tg://proxy" in line:
         try:
             url = urlparse(line)
@@ -56,41 +58,49 @@ def parse_proxy_line(line: str) -> Optional[Tuple[str, int, str]]:
             server = query.get("server")
             port = query.get("port")
             secret = query.get("secret")
+
             if server and port and secret:
                 return server, int(port), secret
         except Exception:
             pass
 
-    # Попробуем raw format: ip:port:secret
-    parts = re.split(r'[:\s]+', line.strip())
+    # raw format
+    parts = re.split(r'[:\\s]+', line.strip())
+
     if len(parts) >= 3:
         ip = parts[0]
+
         try:
             port = int(parts[1])
             secret = parts[2]
             return ip, port, secret
         except ValueError:
             pass
+
     return None
 
 
 async def check_port(host: str, port: int) -> bool:
-    """Проверяет, открыт ли порт (TCP connect)."""
+    """Проверка доступности TCP порта."""
+
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
             timeout=TIMEOUT
         )
+
         writer.close()
         await writer.wait_closed()
+
         return True
+
     except Exception:
         return False
 
 
 def detect_proxy_type(secret: str) -> str:
-    """Определяет тип прокси по секрету."""
-    # TLS: длина 32 + префикс 'ee' (или 'dd' для AEAD, но мы пока только TLS/обычный)
+    """Определение типа MTProxy по secret."""
+
     if len(secret) == 32 and secret.startswith(("ee", "dd")):
         return "TLS"
     elif len(secret) == 32:
@@ -100,41 +110,65 @@ def detect_proxy_type(secret: str) -> str:
 
 
 async def fetch_page(url: str) -> str:
-    """Загружает страницу с обработкой ошибок."""
+    """Загрузка страницы через aiohttp."""
+
     try:
-        async with aiohttp.ClientTimeout(total=10):
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-                    return await resp.text()
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"}
+            ) as resp:
+                return await resp.text()
+
     except Exception as e:
         print(f"⚠️ Ошибка при загрузке {url}: {e}")
         return ""
 
 
 async def scrape_proxies() -> List[Tuple[str, int, str]]:
-    """Собирает прокси из всех источников."""
+    """Сбор прокси из источников."""
+
     proxies = set()
+
     for url in PROXY_SOURCES:
         print(f"🔍 Парсинг: {url}")
+
         try:
-            # Для telegram.org используем requests (просто текст)
+            resp = requests.get(
+                url,
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+
             if "proxy.telegram.org" in url:
-                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
                 text = resp.text
             else:
-                # Для Telegram-каналов используем requests + BeautifulSoup
-                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
                 soup = BeautifulSoup(resp.text, "html.parser")
                 text = soup.get_text()
-            lines = text.splitlines()
-            for line in lines[:200]:  # ограничим, чтобы не парсить весь канал
+
+            for line in text.splitlines()[:200]:
                 proxy = parse_proxy_line(line)
+
                 if proxy:
                     proxies.add(proxy)
+
         except Exception as e:
             print(f"❌ Не удалось загрузить {url}: {e}")
 
     return list(proxies)[:MAX_PROXIES_TO_CHECK]
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "🤖 Бот MTProxy Checker готов.\\n"
+            "Используйте /check для проверки прокси."
+        )
+    else:
+        await message.answer("🔒 Доступ запрещён.")
 
 
 @dp.message(Command("check"))
@@ -145,28 +179,33 @@ async def cmd_check(message: Message):
 
     await message.answer("⏳ Начинаю проверку прокси...")
 
-    # Шаг 1: Собрать прокси
     proxies = await scrape_proxies()
+
     if not proxies:
-        await message.answer("❌ Не найдено ни одного прокси для проверки.")
+        await message.answer("❌ Не найдено ни одного прокси.")
         return
 
-    await message.answer(f"🔍 Найдено {len(proxies)} потенциальных прокси. Начинаю проверку...")
+    await message.answer(
+        f"🔍 Найдено {len(proxies)} потенциальных прокси. Проверяю..."
+    )
 
-    # Шаг 2: Проверить каждый прокси
     working = []
     start_time = time.time()
 
     for i, (host, port, secret) in enumerate(proxies, 1):
-        if len(working) >= 10:  # лимит: до 10 рабочих — чтобы не перегружать Telegram
+
+        if len(working) >= 10:
             break
 
-        ping_time = time.time()
+        ping_start = time.time()
+
         is_ok = await check_port(host, port)
-        ping_ms = int((time.time() - ping_time) * 1000)
+
+        ping_ms = int((time.time() - ping_start) * 1000)
 
         if is_ok:
             proxy_type = detect_proxy_type(secret)
+
             working.append({
                 "host": host,
                 "port": port,
@@ -174,47 +213,48 @@ async def cmd_check(message: Message):
                 "type": proxy_type,
                 "ping": ping_ms
             })
-            print(f"✅ [{i}/{len(proxies)}] {host}:{port} ({proxy_type}) — {ping_ms} мс")
 
-        # Легкая задержка, чтобы не спамить
+            print(
+                f"✅ [{i}/{len(proxies)}] {host}:{port} "
+                f"({proxy_type}) — {ping_ms} мс"
+            )
+
         await asyncio.sleep(0.3)
 
-    # Шаг 3: Сформировать ответ
     if not working:
-        await message.answer("❌ Не найдено рабочих прокси.")
+        await message.answer("❌ Рабочих прокси не найдено.")
         return
 
-    msg_lines = [f"🔍 Найдено {len(working)} рабочих прокси:\n"]
+    lines = [f"🔍 Найдено {len(working)} рабочих прокси:\\n"]
+
     for idx, p in enumerate(working, 1):
-        link = f"tg://proxy?server={p['host']}&port={p['port']}&secret={p['secret']}"
-        msg_lines.append(
-            f"{idx}. {p['host']}:{p['port']} ({p['type']})\n"
-            f"   Ping: {p['ping']} мс\n"
-            f"   Ссылка: {link}\n"
+        link = (
+            f"tg://proxy?server={p['host']}&port={p['port']}&secret={p['secret']}"
         )
 
-    msg_lines.append(f"\n✅ Проверка завершена за {int(time.time() - start_time)} сек.")
+        lines.append(
+            f"{idx}. {p['host']}:{p['port']} ({p['type']})\\n"
+            f"   Ping: {p['ping']} мс\\n"
+            f"   {link}\\n"
+        )
 
-    # Отправка (Telegram ограничивает 4096 символов на сообщение)
-    full_msg = "\n".join(msg_lines)
+    lines.append(
+        f"\\n✅ Проверка завершена за {int(time.time() - start_time)} сек."
+    )
+
+    full_msg = "\\n".join(lines)
+
     if len(full_msg) > 4000:
-        full_msg = full_msg[:3900] + "\n\n...(обрезано)"
+        full_msg = full_msg[:3900] + "\\n\\n...(обрезано)"
 
     await message.answer(full_msg, disable_web_page_preview=True)
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    if is_admin(message.from_user.id):
-        await message.answer(
-            "🤖 Бот MTProxy Checker готов.\n"
-            "Используйте команду /check для запуска проверки."
-        )
-    else:
-        await message.answer("🔒 Доступ запрещён.")
+# === Запуск ===
+async def main():
+    print("🚀 Бот запущен. Ожидание команд...")
+    await dp.start_polling(bot)
 
 
-# Запуск
-async def main(): print("🚀 Бот запущен. Ожидание команды /check...") 
-    await dp.start_polling(bot) 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
