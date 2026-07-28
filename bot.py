@@ -30,6 +30,11 @@ PROXY_SOURCES = [
     "https://t.me/addlist",
     "https://t.me/ProxyFree_Ru",
     "https://t.me/ProxyFree_RuBot",
+    "https://t.me/ProxyFree_Russ",
+    "https://t.me/ProxyFree_Ru_bot",
+    "https://t.me/ProxyFreeMTProto",
+    "https://t.me/mtp4tg",
+    "https://t.me/memtproxy",
 ]
 
 TIMEOUT = 5.0
