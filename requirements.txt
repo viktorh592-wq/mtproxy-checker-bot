@@ -1,4 +1,4 @@
-aiogram==3.20.0
-aiohttp==3.11.16
+aiogram==3.30.0
+aiohttp==3.14.3
 requests==2.32.3
 beautifulsoup4==4.12.3
