@@ -214,11 +214,6 @@ async def cmd_start(message: Message):
 
 
 # Запуск
-async def main():
-    print("🚀 Бот запущен. Ожидание команды /check...")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    import aiohttp
-    asyncio.run(main())
+async def main(): print("🚀 Бот запущен. Ожидание команды /check...") 
+    await dp.start_polling(bot) 
+if __name__ == "__main__": asyncio.run(main())
