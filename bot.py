@@ -6,7 +6,8 @@ import asyncio
 from typing import List, Tuple, Optional
 from urllib.parse import urlparse
 
-import requests
+import aiohttp 
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
