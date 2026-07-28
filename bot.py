@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -65,7 +66,7 @@ def parse_proxy_line(line: str) -> Optional[Tuple[str, int, str]]:
             pass
 
     # raw format
-    parts = re.split(r'[:\\s]+', line.strip())
+    parts = re.split(r"[:\s]+", line.strip())
 
     if len(parts) >= 3:
         ip = parts[0]
@@ -164,7 +165,7 @@ async def scrape_proxies() -> List[Tuple[str, int, str]]:
 async def cmd_start(message: Message):
     if is_admin(message.from_user.id):
         await message.answer(
-            "🤖 Бот MTProxy Checker готов.\\n"
+            "🤖 Бот MTProxy Checker готов.\n"
             "Используйте /check для проверки прокси."
         )
     else:
@@ -225,7 +226,7 @@ async def cmd_check(message: Message):
         await message.answer("❌ Рабочих прокси не найдено.")
         return
 
-    lines = [f"🔍 Найдено {len(working)} рабочих прокси:\\n"]
+    lines = [f"🔍 Найдено {len(working)} рабочих прокси:\n"]
 
     for idx, p in enumerate(working, 1):
         link = (
@@ -233,27 +234,54 @@ async def cmd_check(message: Message):
         )
 
         lines.append(
-            f"{idx}. {p['host']}:{p['port']} ({p['type']})\\n"
-            f"   Ping: {p['ping']} мс\\n"
-            f"   {link}\\n"
+            f"{idx}. {p['host']}:{p['port']} ({p['type']})\n"
+            f"   Ping: {p['ping']} мс\n"
+            f"   {link}\n"
         )
 
     lines.append(
-        f"\\n✅ Проверка завершена за {int(time.time() - start_time)} сек."
+        f"\n✅ Проверка завершена за {int(time.time() - start_time)} сек."
     )
 
-    full_msg = "\\n".join(lines)
+    full_msg = "\n".join(lines)
 
     if len(full_msg) > 4000:
-        full_msg = full_msg[:3900] + "\\n\\n...(обрезано)"
+        full_msg = full_msg[:3900] + "\n\n...(обрезано)"
 
     await message.answer(full_msg, disable_web_page_preview=True)
 
 
 # === Запуск ===
+async def start_health_server() -> web.AppRunner:
+    """Поднимает HTTP endpoint для Render health/port scan."""
+    app = web.Application()
+
+    async def health(_: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "service": "mtproxy-checker-bot"})
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+
+    print(f"🌐 Health server listening on 0.0.0.0:{port}")
+    return runner
+
+
 async def main():
+    health_runner = await start_health_server()
+
     print("🚀 Бот запущен. Ожидание команд...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        await health_runner.cleanup()
 
 
 if __name__ == "__main__":
