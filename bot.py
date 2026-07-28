@@ -66,7 +66,7 @@ def parse_proxy_line(line: str) -> Optional[Tuple[str, int, str]]:
             pass
 
     # raw format
-    parts = re.split(r"[:\s]+", line.strip())
+    parts = re.split(r'[:\s]+', line.strip())
 
     if len(parts) >= 3:
         ip = parts[0]
@@ -252,36 +252,23 @@ async def cmd_check(message: Message):
 
 
 # === Запуск ===
-async def start_health_server() -> web.AppRunner:
-    """Поднимает HTTP endpoint для Render health/port scan."""
-    app = web.Application()
-
-    async def health(_: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "service": "mtproxy-checker-bot"})
-
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    port = int(os.getenv("PORT", "10000"))
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-
-    print(f"🌐 Health server listening on 0.0.0.0:{port}")
-    return runner
+async def healthcheck(request):
+    return web.Response(text="ok")
 
 
 async def main():
-    health_runner = await start_health_server()
+    # HTTP-заглушка: Render Web Service требует открытый порт
+    app = web.Application()
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"🌐 HTTP-заглушка слушает порт {port}")
 
     print("🚀 Бот запущен. Ожидание команд...")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        await health_runner.cleanup()
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
