@@ -355,5 +355,156 @@ async def run_check(message: Message, user_id: int):
             return
 
         # самые быстрые — в топ
-        working.sort(key=lambda p: p["ping"])
+                working.sort(key=lambda p: p["ping"])
         working = working[:MAX_WORKING]
+
+        lines = [f"🔍 Найдено {len(working)} рабочих прокси:\n"]
+
+        for idx, p in enumerate(working, 1):
+            link = (
+                f"tg://proxy?server={p['host']}&port={p['port']}&secret={p['secret']}"
+            )
+            lines.append(
+                f"{idx}. {p['host']}:{p['port']} ({p['type']})\n"
+                f"   Ping: {p['ping']} мс\n"
+                f"   {link}\n"
+            )
+
+        lines.append(
+            f"\n✅ Проверка завершена за {int(time.time() - start_time)} сек."
+        )
+
+        full_msg = "\n".join(lines)
+
+        if len(full_msg) > 4000:
+            full_msg = full_msg[:3900] + "\n\n...(обрезано)"
+
+        # результат появляется в том же сообщении-статусе, с кнопкой "ещё раз"
+        await status.edit_text(
+            full_msg,
+            reply_markup=REFRESH_KB,
+            disable_web_page_preview=True,
+        )
+
+
+# === Хендлеры: команда, кнопка, инлайн-кнопки ===
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user = message.from_user
+
+    if has_access(user.id):
+        await message.answer(
+            "🤖 Бот MTProxy Checker.\n"
+            "Жмите кнопку ниже — найдём рабочие прокси.",
+            reply_markup=MAIN_KB,
+        )
+    else:
+        # отправляем заявку админам на доступ
+        await request_access(message, user)
+
+
+@dp.message(Command("check"))
+async def cmd_check(message: Message):
+    await run_check(message, message.from_user.id)
+
+
+@dp.message(F.text == CHECK_BTN)
+async def btn_check(message: Message):
+    await run_check(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "check_again")
+async def cb_check(callback: CallbackQuery):
+    if not has_access(callback.from_user.id):
+        await callback.answer(
+            "🔒 Доступ по заявке. Нажмите /start.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Запускаю проверку...")
+    await run_check(callback.message, callback.from_user.id)
+
+
+# === Решения админа по заявкам ===
+@dp.callback_query(F.data.startswith("approve:"))
+async def cb_approve(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только для администратора.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":", 1)[1])
+    pending.discard(user_id)
+    rejected.discard(user_id)
+    approved.add(user_id)
+    save_db()
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ Доступ одобрен."
+    )
+    try:
+        await bot.send_message(
+            user_id,
+            "✅ Вам одобрили доступ к боту!\nЖмите кнопку ниже — найдём рабочие прокси.",
+            reply_markup=MAIN_KB,
+        )
+    except Exception:
+        pass
+    await callback.answer("Одобрено")
+
+
+@dp.callback_query(F.data.startswith("reject:"))
+async def cb_reject(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только для администратора.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":", 1)[1])
+    pending.discard(user_id)
+    approved.discard(user_id)
+    rejected.add(user_id)
+    save_db()
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n❌ Доступ отклонён."
+    )
+    try:
+        await bot.send_message(user_id, "❌ Администратор отклонил вашу заявку.")
+    except Exception:
+        pass
+    await callback.answer("Отклонено")
+
+
+# === Запуск ===
+async def healthcheck(request):
+    return web.Response(text="ok")
+
+
+async def main():
+    # загружаем базу доступа (заявки/одобренные)
+    load_db()
+
+    # сброс старых сессий/апдейтов, чтобы не конфликтовать с прошлым инстансом
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # меню команд (кнопка ☰ рядом с полем ввода)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="check", description="Чекнуть прокси"),
+    ])
+
+    # HTTP-заглушка: Render Web Service требует открытый порт
+    app = web.Application()
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"🌐 HTTP-заглушка слушает порт {port}")
+
+    print("🚀 Бот запущен. Ожидание команд...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
