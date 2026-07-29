@@ -9,9 +9,17 @@ from urllib.parse import urlparse, parse_qs
 import requests
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    BotCommand,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 # === Настройки ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -56,6 +64,22 @@ SECRET_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# === Кнопки ===
+CHECK_BTN = "🔍 Чекнуть прокси"
+
+# постоянная клавиатура под полем ввода
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=CHECK_BTN)]],
+    resize_keyboard=True,
+)
+
+# инлайн-кнопка под результатом проверки
+REFRESH_KB = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data="check_again")]
+    ]
+)
 
 
 def is_admin(user_id: int) -> bool:
@@ -179,34 +203,25 @@ async def probe(sem: asyncio.Semaphore, host: str, port: int, secret: str):
         return (host, port, secret), ping_ms, is_ok
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    if is_admin(message.from_user.id):
-        await message.answer(
-            "🤖 Бот MTProxy Checker готов.\n"
-            "Используйте /check для проверки прокси."
-        )
-    else:
-        await message.answer("🔒 Доступ запрещён.")
-
-
-@dp.message(Command("check"))
-async def cmd_check(message: Message):
-    if not is_admin(message.from_user.id):
+# === Логика проверки (общая для команды, кнопки и инлайн-кнопки) ===
+async def run_check(message: Message, user_id: int):
+    if not is_admin(user_id):
         await message.answer("🔒 Доступ запрещён. Вы не администратор.")
         return
 
     start_time = time.time()
-    await message.answer("⏳ Собираю прокси из каналов...")
+    status = await message.answer("⏳ Собираю прокси из каналов...")
 
     # синхронный парсинг уводим в отдельный поток, чтобы не блокировать бота
     candidates = await asyncio.to_thread(scrape_all)
 
     if not candidates:
-        await message.answer("❌ Не найдено ни одного прокси.")
+        await status.edit_text("❌ Не найдено ни одного прокси.")
         return
 
-    await message.answer(f"🔍 Найдено {len(candidates)} кандидатов. Проверяю порты...")
+    await status.edit_text(
+        f"🔍 Найдено {len(candidates)} кандидатов. Проверяю порты..."
+    )
 
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
     results = await asyncio.gather(
@@ -225,7 +240,10 @@ async def cmd_check(message: Message):
             })
 
     if not working:
-        await message.answer("❌ Рабочих прокси не найдено.")
+        await status.edit_text(
+            "❌ Рабочих прокси не найдено.",
+            reply_markup=REFRESH_KB,
+        )
         return
 
     # самые быстрые — в топ
@@ -253,7 +271,44 @@ async def cmd_check(message: Message):
     if len(full_msg) > 4000:
         full_msg = full_msg[:3900] + "\n\n...(обрезано)"
 
-    await message.answer(full_msg, disable_web_page_preview=True)
+    # результат появляется в том же сообщении-статусе, с кнопкой "ещё раз"
+    await status.edit_text(
+        full_msg,
+        reply_markup=REFRESH_KB,
+        disable_web_page_preview=True,
+    )
+
+
+# === Хендлеры: команда, кнопка, инлайн-кнопка ===
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "🤖 Бот MTProxy Checker готов.\n"
+            "Жмите кнопку ниже или /check.",
+            reply_markup=MAIN_KB,
+        )
+    else:
+        await message.answer("🔒 Доступ запрещён.")
+
+
+@dp.message(Command("check"))
+async def cmd_check(message: Message):
+    await run_check(message, message.from_user.id)
+
+
+@dp.message(F.text == CHECK_BTN)
+async def btn_check(message: Message):
+    await run_check(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "check_again")
+async def cb_check(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("🔒 Доступ запрещён.", show_alert=True)
+        return
+    await callback.answer("Запускаю проверку...")
+    await run_check(callback.message, callback.from_user.id)
 
 
 # === Запуск ===
@@ -262,8 +317,14 @@ async def healthcheck(request):
 
 
 async def main():
-    # Сброс старых сессий/апдейтов, чтобы не конфликтовать с прошлым инстансом
+    # сброс старых сессий/апдейтов, чтобы не конфликтовать с прошлым инстансом
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # меню команд (кнопка ☰ рядом с полем ввода)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="check", description="Чекнуть прокси"),
+    ])
 
     # HTTP-заглушка: Render Web Service требует открытый порт
     app = web.Application()
