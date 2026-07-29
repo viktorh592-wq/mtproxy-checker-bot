@@ -2,8 +2,9 @@ import os
 import re
 import time
 import asyncio
-from typing import List, Tuple, Optional
-from urllib.parse import urlparse
+from html import unescape
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs
 
 import requests
 import aiohttp
@@ -11,7 +12,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
-from bs4 import BeautifulSoup
 
 # === Настройки ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -24,21 +24,35 @@ if not ADMIN_IDS:
     raise RuntimeError("❌ ADMIN_IDS не установлены!")
 
 # === Источники прокси ===
-PROXY_SOURCES = [
+# Каналы читаем через веб-превью t.me/s/<name> — только там видны сообщения
+# (обычная страница t.me/<name> — заглушка без постов!)
+CHANNELS = [
+    "proxy",
+    "addlist",
+    "ProxyFree_Ru",
+    "ProxyFree_RuBot",
+    "ProxyFree_Russ",
+    "ProxyFree_Ru_bot",
+    "ProxyFreeMTProto",
+    "mtp4tg",
+    "memtproxy",
+]
+EXTRA_SOURCES = [
     "https://proxy.telegram.org",
-    "https://t.me/proxy",
-    "https://t.me/addlist",
-    "https://t.me/ProxyFree_Ru",
-    "https://t.me/ProxyFree_RuBot",
-    "https://t.me/ProxyFree_Russ",
-    "https://t.me/ProxyFree_Ru_bot",
-    "https://t.me/ProxyFreeMTProto",
-    "https://t.me/mtp4tg",
-    "https://t.me/memtproxy",
 ]
 
 TIMEOUT = 5.0
-MAX_PROXIES_TO_CHECK = 50
+MAX_PROXIES_TO_CHECK = 60   # сколько кандидатов максимум проверять
+MAX_WORKING = 10            # сколько рабочих показывать в ответе
+CHANNEL_PAGES = 2           # страниц истории на канал (~20 постов каждая) => последние ~40 постов
+CHECK_CONCURRENCY = 10      # параллельных проверок портов
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# tg://proxy?server=...&port=...&secret=...  (в HTML может быть с &amp; — лечим unescape)
+TG_PROXY_RE = re.compile(r"tg://proxy\?[^\s\"'<>)]+", re.IGNORECASE)
+# Текстовый формат  ip:port:secret  (secret — 32+ hex-символов)
+RAW_PROXY_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}):([0-9a-fA-F]{32,})\b")
+SECRET_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -48,122 +62,121 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def parse_proxy_line(line: str) -> Optional[Tuple[str, int, str]]:
-    """
-    Извлекает IP:PORT:SECRET из строки.
-    Поддерживает:
-    - tg://proxy?server=ip&port=port&secret=secret
-    - ip:port:secret
-    """
+def parse_tg_link(raw: str) -> Optional[Tuple[str, int, str]]:
+    """Разбор ссылки tg://proxy?server=..&port=..&secret=.."""
+    try:
+        query = parse_qs(urlparse(unescape(raw)).query)
+        host = query.get("server", [None])[0]
+        secret = query.get("secret", [None])[0]
+        port = int(query.get("port", ["0"])[0])
 
-    # tg://proxy
-    if "tg://proxy" in line:
-        try:
-            url = urlparse(line)
-            query = dict(q.split("=") for q in url.query.split("&"))
-            server = query.get("server")
-            port = query.get("port")
-            secret = query.get("secret")
-
-            if server and port and secret:
-                return server, int(port), secret
-        except Exception:
-            pass
-
-    # raw format
-    parts = re.split(r'[:\s]+', line.strip())
-
-    if len(parts) >= 3:
-        ip = parts[0]
-
-        try:
-            port = int(parts[1])
-            secret = parts[2]
-            return ip, port, secret
-        except ValueError:
-            pass
-
+        if host and secret and 0 < port < 65536 and SECRET_RE.match(secret):
+            return host, port, secret
+    except Exception:
+        pass
     return None
+
+
+def extract_proxies(content: str) -> Dict[Tuple[str, int], Tuple[str, int, str]]:
+    """Все прокси со страницы: и кликабельные ссылки, и текстовый формат."""
+    found: Dict[Tuple[str, int], Tuple[str, int, str]] = {}
+
+    # 1) tg://proxy ссылки (кнопки и href — основной формат в каналах)
+    for match in TG_PROXY_RE.finditer(content):
+        proxy = parse_tg_link(match.group(0))
+        if proxy:
+            found[(proxy[0], proxy[1])] = proxy
+
+    # 2) текстовый ip:port:secret
+    for match in RAW_PROXY_RE.finditer(content):
+        host, port_str, secret = match.groups()
+        if SECRET_RE.match(secret):
+            found.setdefault((host, int(port_str)), (host, int(port_str), secret))
+
+    return found
+
+
+def fetch_html(url: str) -> str:
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": USER_AGENT})
+        if resp.status_code == 200:
+            return resp.text
+        print(f"⚠️ {url}: HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"❌ Не удалось загрузить {url}: {e}")
+    return ""
+
+
+def scrape_channel(name: str) -> Dict[Tuple[str, int], Tuple[str, int, str]]:
+    """Веб-превью канала t.me/s/<name> с листанием назад (?before=<id>)."""
+    proxies: Dict[Tuple[str, int], Tuple[str, int, str]] = {}
+    url = f"https://t.me/s/{name}"
+
+    for _ in range(CHANNEL_PAGES):
+        html = fetch_html(url)
+        if not html:
+            break
+
+        proxies.update(extract_proxies(html))
+
+        # id самого раннего сообщения на странице — для следующей страницы истории
+        ids = [int(x) for x in re.findall(r'data-post="[^"]*/(\d+)"', html)]
+        if not ids:
+            break
+        url = f"https://t.me/s/{name}?before={min(ids)}"
+
+    return proxies
+
+
+def scrape_all() -> List[Tuple[str, int, str]]:
+    """Сбор кандидатов со всех источников (синхронно, запускать через to_thread)."""
+    proxies: Dict[Tuple[str, int], Tuple[str, int, str]] = {}
+
+    for url in EXTRA_SOURCES:
+        print(f"🔍 Парсинг: {url}")
+        proxies.update(extract_proxies(fetch_html(url)))
+
+    for name in CHANNELS:
+        print(f"🔍 Парсинг: t.me/{name}")
+        proxies.update(scrape_channel(name))
+
+    print(f"📦 Всего уникальных кандидатов: {len(proxies)}")
+    return list(proxies.values())[:MAX_PROXIES_TO_CHECK]
 
 
 async def check_port(host: str, port: int) -> bool:
     """Проверка доступности TCP порта."""
-
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
             timeout=TIMEOUT
         )
-
         writer.close()
         await writer.wait_closed()
-
         return True
-
     except Exception:
         return False
 
 
 def detect_proxy_type(secret: str) -> str:
     """Определение типа MTProxy по secret."""
-
-    if len(secret) == 32 and secret.startswith(("ee", "dd")):
-        return "TLS"
-    elif len(secret) == 32:
+    low = secret.lower()
+    if low.startswith("ee"):
+        return "Fake-TLS"
+    if low.startswith("dd"):
+        return "TLS (random padding)"
+    if len(secret) == 32:
         return "Обычный"
-    else:
-        return "Неизвестный"
+    return "Неизвестный"
 
 
-async def fetch_page(url: str) -> str:
-    """Загрузка страницы через aiohttp."""
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"}
-            ) as resp:
-                return await resp.text()
-
-    except Exception as e:
-        print(f"⚠️ Ошибка при загрузке {url}: {e}")
-        return ""
-
-
-async def scrape_proxies() -> List[Tuple[str, int, str]]:
-    """Сбор прокси из источников."""
-
-    proxies = set()
-
-    for url in PROXY_SOURCES:
-        print(f"🔍 Парсинг: {url}")
-
-        try:
-            resp = requests.get(
-                url,
-                timeout=10,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-
-            if "proxy.telegram.org" in url:
-                text = resp.text
-            else:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                text = soup.get_text()
-
-            for line in text.splitlines()[:200]:
-                proxy = parse_proxy_line(line)
-
-                if proxy:
-                    proxies.add(proxy)
-
-        except Exception as e:
-            print(f"❌ Не удалось загрузить {url}: {e}")
-
-    return list(proxies)[:MAX_PROXIES_TO_CHECK]
+async def probe(sem: asyncio.Semaphore, host: str, port: int, secret: str):
+    """Проверка одного прокси под семафором (чтобы не дудосить)."""
+    async with sem:
+        start = time.time()
+        is_ok = await check_port(host, port)
+        ping_ms = int((time.time() - start) * 1000)
+        return (host, port, secret), ping_ms, is_ok
 
 
 @dp.message(Command("start"))
@@ -183,53 +196,41 @@ async def cmd_check(message: Message):
         await message.answer("🔒 Доступ запрещён. Вы не администратор.")
         return
 
-    await message.answer("⏳ Начинаю проверку прокси...")
+    start_time = time.time()
+    await message.answer("⏳ Собираю прокси из каналов...")
 
-    proxies = await scrape_proxies()
+    # синхронный парсинг уводим в отдельный поток, чтобы не блокировать бота
+    candidates = await asyncio.to_thread(scrape_all)
 
-    if not proxies:
+    if not candidates:
         await message.answer("❌ Не найдено ни одного прокси.")
         return
 
-    await message.answer(
-        f"🔍 Найдено {len(proxies)} потенциальных прокси. Проверяю..."
+    await message.answer(f"🔍 Найдено {len(candidates)} кандидатов. Проверяю порты...")
+
+    sem = asyncio.Semaphore(CHECK_CONCURRENCY)
+    results = await asyncio.gather(
+        *(probe(sem, host, port, secret) for host, port, secret in candidates)
     )
 
     working = []
-    start_time = time.time()
-
-    for i, (host, port, secret) in enumerate(proxies, 1):
-
-        if len(working) >= 10:
-            break
-
-        ping_start = time.time()
-
-        is_ok = await check_port(host, port)
-
-        ping_ms = int((time.time() - ping_start) * 1000)
-
+    for (host, port, secret), ping_ms, is_ok in results:
         if is_ok:
-            proxy_type = detect_proxy_type(secret)
-
             working.append({
                 "host": host,
                 "port": port,
                 "secret": secret,
-                "type": proxy_type,
-                "ping": ping_ms
+                "type": detect_proxy_type(secret),
+                "ping": ping_ms,
             })
-
-            print(
-                f"✅ [{i}/{len(proxies)}] {host}:{port} "
-                f"({proxy_type}) — {ping_ms} мс"
-            )
-
-        await asyncio.sleep(0.3)
 
     if not working:
         await message.answer("❌ Рабочих прокси не найдено.")
         return
+
+    # самые быстрые — в топ
+    working.sort(key=lambda p: p["ping"])
+    working = working[:MAX_WORKING]
 
     lines = [f"🔍 Найдено {len(working)} рабочих прокси:\n"]
 
@@ -237,7 +238,6 @@ async def cmd_check(message: Message):
         link = (
             f"tg://proxy?server={p['host']}&port={p['port']}&secret={p['secret']}"
         )
-
         lines.append(
             f"{idx}. {p['host']}:{p['port']} ({p['type']})\n"
             f"   Ping: {p['ping']} мс\n"
@@ -262,6 +262,9 @@ async def healthcheck(request):
 
 
 async def main():
+    # Сброс старых сессий/апдейтов, чтобы не конфликтовать с прошлым инстансом
+    await bot.delete_webhook(drop_pending_updates=True)
+
     # HTTP-заглушка: Render Web Service требует открытый порт
     app = web.Application()
     app.router.add_get("/", healthcheck)
