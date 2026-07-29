@@ -217,7 +217,7 @@ def fetch_html(url: str) -> str:
 def scrape_channel(name: str) -> Dict[Tuple[str, int], Tuple[str, int, str]]:
     """Веб-превью канала t.me/s/<name> с листанием назад (?before=<id>)."""
     proxies: Dict[Tuple[str, int], Tuple[str, int, str]] = {}
-    url = fhttps://t.me/s/{name}"
+    url = f"https://t.me/s/{name}"
 
     for _ in range(CHANNEL_PAGES):
         html = fetch_html(url)
