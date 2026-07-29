@@ -355,7 +355,7 @@ async def run_check(message: Message, user_id: int):
             return
 
         # самые быстрые — в топ
-                working.sort(key=lambda p: p["ping"])
+        working.sort(key=lambda p: p["ping"])
         working = working[:MAX_WORKING]
 
         lines = [f"🔍 Найдено {len(working)} рабочих прокси:\n"]
