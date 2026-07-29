@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import asyncio
 from html import unescape
@@ -28,9 +29,6 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN не установлен в переменных окружения!")
 
-if not ADMIN_IDS:
-    raise RuntimeError("❌ ADMIN_IDS не установлены!")
-
 # === Источники прокси ===
 # Каналы читаем через веб-превью t.me/s/<name> — только там видны сообщения
 # (обычная страница t.me/<name> — заглушка без постов!)
@@ -50,10 +48,11 @@ EXTRA_SOURCES = [
 ]
 
 TIMEOUT = 5.0
-MAX_PROXIES_TO_CHECK = 60   # сколько кандидатов максимум проверять
-MAX_WORKING = 10            # сколько рабочих показывать в ответе
+MAX_PROXIES_TO_CHECK = 80   # сколько кандидатов максимум проверять
+MAX_WORKING = 20            # сколько рабочих показывать в ответе
 CHANNEL_PAGES = 2           # страниц истории на канал (~20 постов каждая) => последние ~40 постов
 CHECK_CONCURRENCY = 10      # параллельных проверок портов
+CHECK_COOLDOWN = 60         # пауза между проверками для обычных пользователей (сек)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # tg://proxy?server=...&port=...&secret=...  (в HTML может быть с &amp; — лечим unescape)
@@ -82,8 +81,92 @@ REFRESH_KB = InlineKeyboardMarkup(
 )
 
 
+def request_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопки решения админа по заявке."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Разрешить", callback_data=f"approve:{user_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{user_id}"),
+    ]])
+
+
+# === Состояние ===
+last_check: Dict[int, float] = {}   # user_id -> время последней проверки
+check_lock = asyncio.Lock()         # только одна проверка одновременно
+
+# === Доступ: база заявок/разрешений (файл) ===
+DB_FILE = "access_db.json"
+approved: set = set()   # кому разрешили
+pending: set = set()    # заявки в ожидании
+rejected: set = set()   # кого отклонили
+
+
+def load_db():
+    global approved, pending, rejected
+    try:
+        with open(DB_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        approved = set(data.get("approved", []))
+        pending = set(data.get("pending", []))
+        rejected = set(data.get("rejected", []))
+        print(f"📂 Доступ загружен: {len(approved)} разрешено, {len(pending)} в ожидании")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить {DB_FILE}: {e}")
+
+
+def save_db():
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "approved": sorted(approved),
+                "pending": sorted(pending),
+                "rejected": sorted(rejected),
+            }, f)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить {DB_FILE}: {e}")
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def has_access(user_id: int) -> bool:
+    return is_admin(user_id) or user_id in approved
+
+
+def user_name(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+    return f"{user.first_name or ''} {user.last_name or ''}".strip() or "без имени"
+
+
+async def request_access(message: Message, user):
+    """Отправка заявки админам с инлайн-кнопками решения."""
+    if user.id in pending:
+        await message.answer("⏳ Ваша заявка уже на рассмотрении у администратора.")
+        return
+
+    # повторная заявка после отказа — разрешаем
+    rejected.discard(user.id)
+    pending.add(user.id)
+    save_db()
+
+    await message.answer(
+        "⏳ Заявка отправлена администратору.\n"
+        "Как только доступ одобрят — вам придёт уведомление."
+    )
+
+    text = (
+        f"📩 Запрос на доступ к боту\n"
+        f"Пользователь: {user_name(user)}\n"
+        f"ID: {user.id}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=request_kb(user.id))
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить заявку админу {admin_id}: {e}")
 
 
 def parse_tg_link(raw: str) -> Optional[Tuple[str, int, str]]:
@@ -134,7 +217,7 @@ def fetch_html(url: str) -> str:
 def scrape_channel(name: str) -> Dict[Tuple[str, int], Tuple[str, int, str]]:
     """Веб-превью канала t.me/s/<name> с листанием назад (?before=<id>)."""
     proxies: Dict[Tuple[str, int], Tuple[str, int, str]] = {}
-    url = f"https://t.me/s/{name}"
+    url = fhttps://t.me/s/{name}"
 
     for _ in range(CHANNEL_PAGES):
         html = fetch_html(url)
@@ -205,140 +288,72 @@ async def probe(sem: asyncio.Semaphore, host: str, port: int, secret: str):
 
 # === Логика проверки (общая для команды, кнопки и инлайн-кнопки) ===
 async def run_check(message: Message, user_id: int):
-    if not is_admin(user_id):
-        await message.answer("🔒 Доступ запрещён. Вы не администратор.")
-        return
-
-    start_time = time.time()
-    status = await message.answer("⏳ Собираю прокси из каналов...")
-
-    # синхронный парсинг уводим в отдельный поток, чтобы не блокировать бота
-    candidates = await asyncio.to_thread(scrape_all)
-
-    if not candidates:
-        await status.edit_text("❌ Не найдено ни одного прокси.")
-        return
-
-    await status.edit_text(
-        f"🔍 Найдено {len(candidates)} кандидатов. Проверяю порты..."
-    )
-
-    sem = asyncio.Semaphore(CHECK_CONCURRENCY)
-    results = await asyncio.gather(
-        *(probe(sem, host, port, secret) for host, port, secret in candidates)
-    )
-
-    working = []
-    for (host, port, secret), ping_ms, is_ok in results:
-        if is_ok:
-            working.append({
-                "host": host,
-                "port": port,
-                "secret": secret,
-                "type": detect_proxy_type(secret),
-                "ping": ping_ms,
-            })
-
-    if not working:
-        await status.edit_text(
-            "❌ Рабочих прокси не найдено.",
-            reply_markup=REFRESH_KB,
-        )
-        return
-
-    # самые быстрые — в топ
-    working.sort(key=lambda p: p["ping"])
-    working = working[:MAX_WORKING]
-
-    lines = [f"🔍 Найдено {len(working)} рабочих прокси:\n"]
-
-    for idx, p in enumerate(working, 1):
-        link = (
-            f"tg://proxy?server={p['host']}&port={p['port']}&secret={p['secret']}"
-        )
-        lines.append(
-            f"{idx}. {p['host']}:{p['port']} ({p['type']})\n"
-            f"   Ping: {p['ping']} мс\n"
-            f"   {link}\n"
-        )
-
-    lines.append(
-        f"\n✅ Проверка завершена за {int(time.time() - start_time)} сек."
-    )
-
-    full_msg = "\n".join(lines)
-
-    if len(full_msg) > 4000:
-        full_msg = full_msg[:3900] + "\n\n...(обрезано)"
-
-    # результат появляется в том же сообщении-статусе, с кнопкой "ещё раз"
-    await status.edit_text(
-        full_msg,
-        reply_markup=REFRESH_KB,
-        disable_web_page_preview=True,
-    )
-
-
-# === Хендлеры: команда, кнопка, инлайн-кнопка ===
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    if is_admin(message.from_user.id):
+    # доступ: только админы и одобренные пользователи
+    if not has_access(user_id):
         await message.answer(
-            "🤖 Бот MTProxy Checker готов.\n"
-            "Жмите кнопку ниже или /check.",
-            reply_markup=MAIN_KB,
+            "🔒 Доступ по заявке. Нажмите /start, чтобы отправить её администратору."
         )
-    else:
-        await message.answer("🔒 Доступ запрещён.")
-
-
-@dp.message(Command("check"))
-async def cmd_check(message: Message):
-    await run_check(message, message.from_user.id)
-
-
-@dp.message(F.text == CHECK_BTN)
-async def btn_check(message: Message):
-    await run_check(message, message.from_user.id)
-
-
-@dp.callback_query(F.data == "check_again")
-async def cb_check(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("🔒 Доступ запрещён.", show_alert=True)
         return
-    await callback.answer("Запускаю проверку...")
-    await run_check(callback.message, callback.from_user.id)
 
+    # кулдаун для обычных пользователей (админы — без ограничений)
+    if not is_admin(user_id):
+        wait = int(CHECK_COOLDOWN - (time.time() - last_check.get(user_id, 0)))
+        if wait > 0:
+            await message.answer(
+                f"⏳ Проверку уже запускали недавно. "
+                f"Попробуйте снова через {wait} сек."
+            )
+            return
 
-# === Запуск ===
-async def healthcheck(request):
-    return web.Response(text="ok")
+    # не запускаем вторую проверку, пока идёт предыдущая
+    if check_lock.locked():
+        await message.answer("⏳ Идёт другая проверка, подождите немного...")
+        return
 
+    last_check[user_id] = time.time()
 
-async def main():
-    # сброс старых сессий/апдейтов, чтобы не конфликтовать с прошлым инстансом
-    await bot.delete_webhook(drop_pending_updates=True)
+    async with check_lock:
+        start_time = time.time()
+        status = await message.answer("⏳ Собираю прокси из каналов...")
 
-    # меню команд (кнопка ☰ рядом с полем ввода)
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="check", description="Чекнуть прокси"),
-    ])
+        # синхронный парсинг уводим в отдельный поток, чтобы не блокировать бота
+        try:
+            candidates = await asyncio.to_thread(scrape_all)
+        except Exception as e:
+            await status.edit_text(f"❌ Ошибка при сборе прокси: {e}")
+            return
 
-    # HTTP-заглушка: Render Web Service требует открытый порт
-    app = web.Application()
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/health", healthcheck)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    print(f"🌐 HTTP-заглушка слушает порт {port}")
+        if not candidates:
+            await status.edit_text("❌ Не найдено ни одного прокси.")
+            return
 
-    print("🚀 Бот запущен. Ожидание команд...")
-    await dp.start_polling(bot)
+        await status.edit_text(
+            f"🔍 Найдено {len(candidates)} кандидатов. Проверяю порты..."
+        )
 
+        sem = asyncio.Semaphore(CHECK_CONCURRENCY)
+        results = await asyncio.gather(
+            *(probe(sem, host, port, secret) for host, port, secret in candidates)
+        )
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        working = []
+        for (host, port, secret), ping_ms, is_ok in results:
+            if is_ok:
+                working.append({
+                    "host": host,
+                    "port": port,
+                    "secret": secret,
+                    "type": detect_proxy_type(secret),
+                    "ping": ping_ms,
+                })
+
+        if not working:
+            await status.edit_text(
+                "❌ Рабочих прокси не найдено.",
+                reply_markup=REFRESH_KB,
+            )
+            return
+
+        # самые быстрые — в топ
+        working.sort(key=lambda p: p["ping"])
+        working = working[:MAX_WORKING]
